@@ -3,7 +3,7 @@
 Load a skill into every [Antigravity](https://antigravity.google) CLI session, automatically.
 
 A `SessionStart` hook. Give it the path to a `SKILL.md` and it adds that skill's
-instructions to the session as a system message. It is a static binary of about 500 bytes, written
+instructions to the session as a system message. It is a static binary of under 400 bytes, written
 in assembly, with no runtime dependencies.
 
 ## Requirements

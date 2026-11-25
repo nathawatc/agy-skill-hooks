@@ -1,4 +1,6 @@
-ALL_LDFLAGS = -nostdlib -static -s -Wa,-mx86-used-note=no -Wl,-n -Wl,-z,noexecstack -Wl,-z,nosectionheader -Wl,--build-id=none $(LDFLAGS)
+# No -z noexecstack: it only adds a 56-byte PT_GNU_STACK header. Without one, x86-64
+# Linux 5.8 and newer already map the stack non-executable.
+ALL_LDFLAGS = -nostdlib -static -s -Wa,-mx86-used-note=no -Wl,-n -Wl,-z,nosectionheader -Wl,--build-id=none $(LDFLAGS)
 
 HOOKS_DIR = $(HOME)/.gemini/config/hooks
 
@@ -40,6 +42,7 @@ check: agy-skill-hooks
 	$(call expect_blank,'')
 	$(call expect_blank,' \t\r\n\n')
 	$(call expect_blank,'---\na: b\n---\n\n')
+	$(call expect_blank,'---\na\n---\r')
 	# Frontmatter
 	$(call expect_body,'---\na: b\n---\n\nbody\n','body')
 	$(call expect_body,'---\r\na: b\r\n---\r\nbody\r\n','body')

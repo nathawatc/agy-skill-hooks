@@ -9,69 +9,59 @@
 #
 # x86-64 Linux only. Relies on the kernel zeroing registers at exec.
 
-	.set	SYS_read, 0
 	.set	SYS_write, 1
 	.set	SYS_open, 2
 	.set	SYS_exit, 60
 
-	# The low byte of MAX must be 0: %dl doubles as a NUL.
-	.set	MAX, 256 * 1024
-	# Input, output at the worst-case 6x escape (\u00XX), and the JSON wrapper.
-	.set	FRAME, 7 * MAX + 256
+	# MAX = 1 << MAX_BIT. The frame is 8 x MAX: input, output at the worst-case
+	# 6x escape (\u00XX), and the JSON wrapper. One register holds both the frame
+	# size and the read size.
+	.set	MAX_BIT, 18
+	.set	FRAME_BIT, MAX_BIT + 3
 
 	.text
-	# Defined before use so gas can pick the 2-byte push for .Lprefix_len.
+	# Copied in two overlapping pieces, so that .Lrepeat appears twice.
 .Lprefix:
-	.ascii	"{\"injectSteps\":[{\"systemMessage\":{\"systemMessage\":\""
-	.set	.Lprefix_len, . - .Lprefix
-
-	# Ahead of _start to be in jrcxz range.
-.Lempty:
-	pushq	$0x0a7d7b		# {}\n
-	pushq	%rsp
-	popq	%rsi
-	pushq	$3
-	popq	%rdx
-	jmp	.Lwrite
+	.ascii	"{\"injectSteps\":["
+.Lrepeat:
+	.ascii	"{\"systemMessage\":"
+.Lquote:
+	.ascii	"\""
+.Lprefix_end:
 
 	.globl	_start
 _start:
-	popq	%rbx			# argc
-	popq	%rbx			# argv[0]
-	popq	%rbx			# argv[1], NULL if absent: open gives EFAULT
-	subq	$FRAME, %rsp
-	movl	$MAX, %edx
+	popq	%rdi			# argc
+	popq	%rdi			# argv[0]
+	popq	%rdi			# argv[1], NULL if absent: open gives EFAULT
+	movb	$SYS_open, %al		# %esi is 0: O_RDONLY
+	syscall
+	btsl	$FRAME_BIT, %edx
+	subq	%rdx, %rsp
+	pushq	%rsp
+	popq	%rsi			# %rsi = base of the buffer until .Lnewline
+	pushq	%rax
+	xorl	%edi, %edi
 
-	# The hook contract requires consuming stdin. %edi is already 0.
+	# The hook contract requires consuming stdin.
 .Ldrain:
 	xorl	%eax, %eax		# SYS_read
-	pushq	%rsp
-	popq	%rsi
 	syscall
 	testl	%eax, %eax
 	jg	.Ldrain
 
-	pushq	$SYS_open
-	popq	%rax
-	pushq	%rbx
+	# %eax is 0 again: SYS_read. After a stdin error it is -errno, which is no
+	# syscall and fails. A failed open needs no check: read gives EBADF.
 	popq	%rdi
-	xorl	%esi, %esi		# O_RDONLY
 	syscall
+	movl	%eax, %ecx
+	shrl	$MAX_BIT, %eax		# nonzero for both -errno and too big
+	jnz	.Lcheck			# %rbx is still 0, so .Lcheck rejects
+	movb	%al, (%rsi,%rcx)	# NUL, so the \r\n peek cannot see stale stdin
+	jrcxz	.Lcheck
 
-	# A failed open needs no check: read then fails with EBADF.
-	xchgl	%eax, %edi
-	xorl	%eax, %eax		# SYS_read
-	pushq	%rsp
-	popq	%rsi
-	syscall
-	cmpl	%edx, %eax		# unsigned: catches -errno and too big
-	jae	.Lempty
-	movb	%dl, (%rsi,%rax)	# so the \r\n peek cannot see stale stdin
-	xchgl	%eax, %ecx
-.Lempty_near:
-	jrcxz	.Lempty
-
-	# Universal newlines, in place: \r\n and \r become \n.
+	# Universal newlines, in place: drop the \r of \r\n, other \r become \n.
+	pushq	%rsi			# text start, for .Ltrim
 	pushq	%rsi
 	popq	%rdi
 .Lnewline:
@@ -80,72 +70,79 @@ _start:
 	jne	.Lkeep
 	movb	$'\n', %al
 	cmpb	%al, (%rsi)
-	jne	.Lkeep
-	incq	%rsi
-	decl	%ecx			# the \n is inside the file, so %ecx >= 1
+	je	.Ldrop
 .Lkeep:
 	stosb
-	decl	%ecx
-	jnz	.Lnewline
-	movb	%dl, (%rdi)		# no match below can run past the end
+.Ldrop:
+	loop	.Lnewline
+
+	# Output goes right after the text, sharing its pages. Its { also stops
+	# the scans below: it matches no delimiter and is not blank.
+	pushq	%rdi
+	popq	%rbx			# %rbx = text end
+	movl	$.Lprefix, %esi
+	movb	$.Lquote - .Lprefix, %cl
+	rep movsb
+	subl	$.Lquote - .Lrepeat, %esi
+	movb	$.Lprefix_end - .Lrepeat, %cl
+	rep movsb
 
 	# Skip frontmatter: "---\n" at 0, closed by "\n---\n" at 4 or later.
-	pushq	%rsp
 	popq	%rsi
-	movl	$0x0a2d2d2d, %eax	# "---\n"
-	cmpl	%eax, (%rsi)
-	jne	.Lltrim
-	leaq	3(%rsi), %rdx
+	pushq	%rsi
+	lodsl
+	cmpl	$0x0a2d2d2d, %eax	# "---\n"
+	jne	.Ltrim
+	xchgl	%eax, %edx
 .Lfind:
-	incq	%rdx
-	cmpq	%rdi, %rdx
-	jae	.Lltrim			# unclosed: keep the text as is
-	cmpl	%eax, 1(%rdx)
+	cmpl	%ebx, %esi		# equality only, so 32 bits are enough
+	je	.Ltrim			# unclosed: keep the text as is
+	lodsb
+	cmpb	$'\n', %al
 	jne	.Lfind
-	cmpb	$'\n', (%rdx)
+	cmpl	%edx, (%rsi)
 	jne	.Lfind
-	leaq	5(%rdx), %rsi
+	lodsl
+	pushq	%rsi			# the new start, over the old one
 
 	# Trim both ends of bytes <= space: ASCII whitespace plus other control
-	# characters, but not Unicode spaces. %rsi = start, %rdi = end.
+	# characters, but not Unicode spaces.
+.Ltrim:
+	popq	%rsi
+	pushq	%rbx			# output start, for write
 .Lltrim:
-	cmpq	%rdi, %rsi
-	jae	.Lempty_near		# %rcx is 0 here; a short hop via jrcxz
 	lodsb
 	cmpb	$' ', %al
 	jbe	.Lltrim
-	decq	%rsi
+.Lcheck:
+	cmpq	%rbx, %rsi
+	ja	.Lempty			# ran into the prefix: nothing but blanks
 .Lrtrim:
-	decq	%rdi
-	cmpb	$' ', (%rdi)		# stops at the byte .Lltrim found
+	decq	%rbx			# %rbx = last byte to print
+	cmpb	$' ', (%rbx)		# stops at the byte .Lltrim found
 	jbe	.Lrtrim
-	incq	%rdi
-	movl	%edi, %ecx
-	subl	%esi, %ecx
 
-	# Output goes right after the input, sharing its pages.
-	pushq	%rdi
-	pushq	%rcx
-	pushq	%rsi
-	movl	$.Lprefix, %esi
-	pushq	$.Lprefix_len
-	popq	%rcx
-	rep movsb
-	popq	%rsi
-	popq	%rcx
-
+	# %al already holds the first byte.
 .Lescape:
-	lodsb
 	cmpb	$'"', %al
 	je	.Lbackslash
 	cmpb	$'\\', %al
 	je	.Lbackslash
 	cmpb	$' ', %al
-	jb	.Lcontrol
+	jae	.Lput
+	cmpb	$'\n', %al
+	jne	.Lunicode
+	movb	$'n', %al
+.Lbackslash:
+	movb	$'\\', %ah
+.Lpair:
+	movb	%ah, (%rdi)
+	scasb				# incq %rdi in 1 byte
+.Lput:
 	stosb
-.Lnext:
-	decl	%ecx
-	jnz	.Lescape
+	cmpq	%rbx, %rsi
+	lodsb				# keeps the flags
+	jbe	.Lescape
 
 	movl	$0x5d7d7d22, %eax	# "}}]
 	stosl
@@ -165,28 +162,23 @@ _start:
 	xorl	%edi, %edi
 	syscall
 
-.Lcontrol:
-	cmpb	$'\n', %al
-	jne	.Lunicode
-	movb	$'n', %al
-.Lbackslash:
-	movb	%al, %ah
-	movb	$'\\', %al
-	stosw
-	jmp	.Lnext
+.Lempty:
+	pushq	$0x0a7d7b		# {}\n
+	pushq	%rsp
+	popq	%rsi
+	pushq	$3
+	popq	%rdx
+	jmp	.Lwrite
 
+	# %al < 0x20, so the high digit is 0 or 1.
 .Lunicode:
-	pushq	%rax
-	movl	$0x3030755c, %eax	# \u00
-	stosl
-	popq	%rax
-	movb	%al, %ah
-	shrb	$4, %al
-	andb	$15, %ah
-	cmpb	$10, %ah
-	jb	.Ldigit
-	addb	$'a' - '0' - 10, %ah
-.Ldigit:
-	addw	$0x3030, %ax
-	stosw
-	jmp	.Lnext
+	movl	$0x3030755c, (%rdi)	# \u00
+	scasl				# addq $4, %rdi in 1 byte
+	movb	$'0', %ah
+	cmpb	$0x10, %al
+	sbbb	$-1, %ah		# +1 if %al >= 0x10
+	orb	$'0', %al
+	cmpb	$'9', %al
+	jbe	.Lpair
+	addb	$'a' - '9' - 1, %al
+	jmp	.Lpair
